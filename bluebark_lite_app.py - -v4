@@ -1,0 +1,396 @@
+# bluebark_lite_app.py (Web Interface Edit v4 - High Sensitivity)
+
+import math
+import os
+import stat
+import subprocess
+import sys
+import threading
+import time
+
+from flask import Flask, jsonify, render_template_string, request
+import bluebark_lite
+
+# --- SETTINGS ---
+PIPE_PATH = "/dev/shm/tetra.bin"
+RTL_POWER_FFTW = "/usr/local/bin/rtl_power_fftw"
+SDR_SAMPLE_RATE = 2_000_000
+NO_DATA_VALUE = -99.0
+NO_DATA_SLEEP = 0.001
+DISPLAY_INTERVAL = 0.05
+RESTART_DELAY = 0.25
+
+TOTAL_SIGNAL_STEPS = 13
+FLOOR_DB_START = -32.0
+MIN_THRESHOLD = -42.0
+MAX_THRESHOLD = -14.0
+STEP_SIZE = 2.0
+# Alarm triggert nu relatief: 6 dB boven de ingestelde squelch-vloer
+ALARM_THRESHOLD_OFFSET = 6.0 
+NOISE_FLOOR_ESTIMATE = -46.0
+DEFAULT_GAIN = 380 
+AUTO_SQUELCH_SWEEPS = 15
+AUTO_SQUELCH_MARGIN_DB = 1.0 # Veel strakkere marge voor maximale gevoeligheid
+
+# Geoptimaliseerd voor ultrasnelle TETRA transient response
+SCAN_MODES = {
+    "C2000_PORTO": {"freq": "380M:385M", "bins": 256, "avg": 10, "overlap": 32, "offset": 2},
+    "C2000_MAST": {"freq": "390M:395M", "bins": 256, "avg": 10, "overlap": 32, "offset": 2},
+    "TESTPMR": {"freq": "446M:446.2M", "bins": 256, "avg": 10, "overlap": 32, "offset": 2},
+}
+DEFAULT_MODE = "C2000_PORTO"
+MODE_SEQUENCE = ("C2000_PORTO", "C2000_MAST", "TESTPMR")
+
+# --- STATE MANAGEMENT ---
+class LiteState:
+    def __init__(self):
+        self.floor_db = FLOOR_DB_START
+        self.active_mode = DEFAULT_MODE
+        self.current_gain = DEFAULT_GAIN
+        self.is_active = False
+        self.is_shutting_down = False
+        self.has_received_data = False
+        self.is_auto_floor = False
+
+        self.auto_squelch_done = False
+        self.startup_sweep_count = 0
+        self.startup_max_db = NO_DATA_VALUE
+
+        self.alarm_hold_mono = 0.0
+        self.current_is_alarm = False
+        
+        self.smoothed_steps = 0
+        self.last_step_drop_mono = 0.0
+        self.peak_step = 0
+        self.peak_hold_mono = 0.0
+        self.peak_decay_mono = 0.0
+        
+        self.text_peak_db = NO_DATA_VALUE
+        self.text_peak_mono = 0.0
+        self.display_peak_db = NO_DATA_VALUE
+        self.display_peak_lock = threading.Lock()
+        self.sdr_process = None
+
+state = LiteState()
+c_shared_state = bluebark_lite.SharedState(
+    state.floor_db,
+    SCAN_MODES[state.active_mode]["bins"],
+    SCAN_MODES[state.active_mode]["offset"],
+)
+
+def monotonic_now(): return time.monotonic()
+def clamp_floor(value): return max(MIN_THRESHOLD, min(MAX_THRESHOLD, float(value)))
+
+def set_floor_db(value, auto=False):
+    state.floor_db = clamp_floor(value)
+    state.is_auto_floor = auto
+    c_shared_state.floor_db = state.floor_db
+
+def get_cpu_temp():
+    try:
+        with open("/sys/class/thermal/thermal_zone0/temp", "r") as handle:
+            return int(handle.read()) / 1000.0
+    except Exception:
+        return 0.0
+
+def ensure_fifo(path):
+    if os.path.exists(path):
+        path_stat = os.stat(path)
+        if not stat.S_ISFIFO(path_stat.st_mode):
+            os.remove(path)
+    if not os.path.exists(path):
+        os.mkfifo(path)
+
+def raise_priority():
+    try:
+        os.nice(-10)
+    except OSError:
+        pass
+
+def stop_sdr_process():
+    proc = state.sdr_process
+    state.sdr_process = None
+    if proc is not None and proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.wait(timeout=0.2)
+            except subprocess.TimeoutExpired:
+                pass
+    subprocess.run(["pkill", "-9", "rtl_power_fftw"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+def restart_sdr():
+    cfg = SCAN_MODES[state.active_mode]
+    state.has_received_data = False
+    state.is_active = False
+    state.auto_squelch_done = False
+    state.startup_sweep_count = 0
+    state.startup_max_db = NO_DATA_VALUE
+    state.smoothed_steps = 0
+    state.text_peak_db = NO_DATA_VALUE
+    with state.display_peak_lock:
+        state.display_peak_db = NO_DATA_VALUE
+
+    c_shared_state.max_val = NO_DATA_VALUE
+    c_shared_state.floor_db = state.floor_db
+    c_shared_state.bins = cfg["bins"]
+    c_shared_state.offset = cfg["offset"]
+
+    stop_sdr_process()
+    time.sleep(RESTART_DELAY)
+    ensure_fifo(PIPE_PATH)
+
+    base_path = PIPE_PATH[:-4] if PIPE_PATH.endswith(".bin") else PIPE_PATH
+    cmd = [
+        RTL_POWER_FFTW, "-f", cfg["freq"], "-r", str(SDR_SAMPLE_RATE),
+        "-b", str(cfg["bins"]), "-n", str(cfg["avg"]), "-o", str(cfg["overlap"]),
+        "-g", str(state.current_gain), "-c", "-q", "-m", base_path,
+    ]
+    state.sdr_process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, preexec_fn=raise_priority)
+
+def publish_display_peak(db_val):
+    with state.display_peak_lock:
+        if db_val > state.display_peak_db:
+            state.display_peak_db = db_val
+
+def consume_display_peak():
+    with state.display_peak_lock:
+        current_peak = state.display_peak_db
+        state.display_peak_db = NO_DATA_VALUE
+    return current_peak
+
+def next_mode():
+    current_idx = MODE_SEQUENCE.index(state.active_mode)
+    return MODE_SEQUENCE[(current_idx + 1) % len(MODE_SEQUENCE)]
+
+# --- CORE LOGIC ---
+def update_logic(db_val):
+    if state.is_shutting_down: return
+    now_mono = monotonic_now()
+
+    if not state.has_received_data: return
+
+    threshold = state.floor_db if state.is_active else (state.floor_db + 1.0)
+    state.is_active = db_val >= threshold
+
+    # Directe alarm-trigger zodra een meting x dB boven de squelch-vloer knalt
+    if db_val >= (state.floor_db + ALARM_THRESHOLD_OFFSET):
+        state.alarm_hold_mono = now_mono
+    
+    # Houd het alarm 2 seconden vast voor visuele bevestiging
+    state.current_is_alarm = (now_mono - state.alarm_hold_mono) < 2.0
+
+    db_range = MAX_THRESHOLD - NOISE_FLOOR_ESTIMATE
+    raw_ratio = max(0.0, min(1.0, (db_val - NOISE_FLOOR_ESTIMATE) / db_range))
+    target_steps = int((raw_ratio ** 2.2) * TOTAL_SIGNAL_STEPS)
+
+    if target_steps >= state.smoothed_steps:
+        state.smoothed_steps = target_steps
+        state.last_step_drop_mono = now_mono
+    elif state.smoothed_steps > 0 and (now_mono - state.last_step_drop_mono) > 0.1: # Sneller terugvallen
+        state.smoothed_steps -= 1
+        state.last_step_drop_mono = now_mono
+
+    if state.smoothed_steps >= state.peak_step:
+        state.peak_step = state.smoothed_steps
+        state.peak_hold_mono = now_mono
+    elif state.peak_step > 0 and (now_mono - state.peak_hold_mono) > 3.0:
+        if (now_mono - state.peak_decay_mono) > 0.15:
+            state.peak_step -= 1
+            state.peak_decay_mono = now_mono
+
+    if db_val >= state.text_peak_db:
+        state.text_peak_db = db_val
+        state.text_peak_mono = now_mono
+    elif (now_mono - state.text_peak_mono) > 2.0:
+        state.text_peak_db = db_val
+        state.text_peak_mono = now_mono
+
+def logic_loop():
+    while not state.is_shutting_down:
+        update_logic(consume_display_peak())
+        time.sleep(DISPLAY_INTERVAL)
+
+def sdr_manager_thread():
+    restart_sdr()
+    threading.Thread(target=bluebark_lite.c_sdr_data_thread, args=(c_shared_state,), daemon=True).start()
+
+    while not state.is_shutting_down:
+        db_val = c_shared_state.consume_peak()
+        if db_val == NO_DATA_VALUE:
+            time.sleep(NO_DATA_SLEEP)
+            continue
+
+        state.has_received_data = True
+
+        if not state.auto_squelch_done:
+            state.startup_sweep_count += 1
+            if db_val > state.startup_max_db:
+                state.startup_max_db = db_val
+            if state.startup_sweep_count >= AUTO_SQUELCH_SWEEPS:
+                auto_floor = math.ceil((state.startup_max_db + AUTO_SQUELCH_MARGIN_DB) / 2.0) * 2
+                set_floor_db(auto_floor, auto=True)
+                state.auto_squelch_done = True
+            time.sleep(0.01)
+            continue
+
+        publish_display_peak(db_val)
+        time.sleep(0.01)
+
+# --- FLASK WEBSERVER ---
+app = Flask(__name__)
+
+HTML_TEMPLATE = """
+<!DOCTYPE html><html><head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bluebark Lite Web</title>
+<style>
+  body { background: #111; color: #fff; font-family: Arial, sans-serif; text-align: center; margin: 0; padding: 20px; }
+  .dashboard { display: flex; justify-content: center; align-items: flex-end; gap: 20px; height: 300px; margin-bottom: 30px; }
+  .bars-container { display: flex; flex-direction: column-reverse; gap: 4px; height: 100%; width: 60px; }
+  .bar { height: 15px; background: #333; border-radius: 3px; transition: background 0.1s; }
+  .bar.active { background: #00ffcc; }
+  .bar.peak { background: #ffaa00; }
+  .bar.alarm { background: #ff3333; }
+  
+  .info-panel { text-align: left; font-size: 20px; line-height: 1.8; }
+  .info-panel span { color: #00ffcc; font-weight: bold; }
+  .alarm-text { color: #ff3333 !important; font-size: 24px; display: none; }
+  
+  .controls button { background: #444; color: white; border: none; padding: 15px 25px; margin: 5px; font-size: 16px; border-radius: 5px; cursor: pointer; }
+  .controls button:hover { background: #555; }
+  .slider-container { margin-top: 25px; background: #222; padding: 15px; border-radius: 8px; display: inline-block; width: 80%; max-width: 400px; }
+  .slider-container label { font-size: 18px; font-weight: bold; }
+  input[type=range] { width: 100%; margin-top: 15px; }
+</style>
+</head><body>
+  <h2>TETRA SDR Scanner</h2>
+  
+  <div class="dashboard">
+    <div class="bars-container" id="bars"></div>
+    <div class="info-panel">
+      <div>Mode: <span id="mode">-</span></div>
+      <div>Squelch: <span id="squelch">-</span> dB</div>
+      <div>Peak: <span id="peak">-</span> dB</div>
+      <div>Temp: <span id="temp">-</span> °C</div>
+      <div id="alarm-box" class="alarm-text">⚠️ ALARM!</div>
+    </div>
+  </div>
+
+  <div class="controls">
+    <button onclick="doAction('squelch_up')">Squelch +1dB</button>
+    <button onclick="doAction('squelch_down')">Squelch -1dB</button>
+    <button onclick="doAction('mode_long')">Verander Mode</button>
+    
+    <br>
+    
+    <div class="slider-container">
+      <label>SDR Gain: <span id="gain-label">-</span></label>
+      <input type="range" id="gain-slider" min="0" max="496" step="1">
+    </div>
+  </div>
+
+<script>
+  const barsDiv = document.getElementById('bars');
+  const gainSlider = document.getElementById('gain-slider');
+  const gainLabel = document.getElementById('gain-label');
+
+  for(let i=0; i<13; i++) {
+    let b = document.createElement('div');
+    b.className = 'bar';
+    b.id = 'bar-' + i;
+    barsDiv.appendChild(b);
+  }
+
+  gainSlider.addEventListener('input', (e) => {
+    gainLabel.innerText = e.target.value;
+  });
+
+  gainSlider.addEventListener('change', (e) => {
+    fetch('/api/action', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({action: 'set_gain', value: parseInt(e.target.value)})
+    });
+  });
+
+  setInterval(() => {
+    fetch('/api/state').then(r => r.json()).then(data => {
+      document.getElementById('mode').innerText = data.active_mode;
+      document.getElementById('squelch').innerText = data.floor_db;
+      document.getElementById('peak').innerText = data.text_peak_db;
+      document.getElementById('temp').innerText = data.cpu_temp;
+      
+      if (document.activeElement !== gainSlider) {
+          gainSlider.value = data.current_gain;
+          gainLabel.innerText = data.current_gain;
+      }
+      
+      document.getElementById('alarm-box').style.display = data.is_alarm ? 'block' : 'none';
+
+      for(let i=0; i<13; i++) {
+        let bar = document.getElementById('bar-' + i);
+        bar.className = 'bar';
+        if (i < data.smoothed_steps) {
+            bar.classList.add(data.is_alarm ? 'alarm' : 'active');
+        } else if (i === data.peak_step - 1) {
+            bar.classList.add('peak');
+        }
+      }
+    });
+  }, 100);
+
+  function doAction(action) {
+    fetch('/api/action', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({action: action})
+    });
+  }
+</script>
+</body></html>
+"""
+
+@app.route('/')
+def index():
+    return render_template_string(HTML_TEMPLATE)
+
+@app.route('/api/state')
+def get_state():
+    return jsonify({
+        "smoothed_steps": state.smoothed_steps,
+        "peak_step": state.peak_step,
+        "is_alarm": state.current_is_alarm,
+        "floor_db": int(state.floor_db) if state.is_auto_floor else state.floor_db,
+        "active_mode": state.active_mode,
+        "current_gain": state.current_gain,
+        "text_peak_db": int(state.text_peak_db) if state.text_peak_db > NOISE_FLOOR_ESTIMATE else "---",
+        "cpu_temp": get_cpu_temp()
+    })
+
+@app.route('/api/action', methods=['POST'])
+def do_action():
+    action = request.json.get('action')
+    # Squelch stappen verkleind naar 1.0 dB voor preciezere afstelling
+    if action == "squelch_up":
+        set_floor_db(state.floor_db + 1.0, auto=False)
+    elif action == "squelch_down":
+        set_floor_db(state.floor_db - 1.0, auto=False)
+    elif action == "mode_long":
+        state.active_mode = next_mode()
+        restart_sdr()
+    elif action == "set_gain":
+        new_gain = request.json.get('value', DEFAULT_GAIN)
+        state.current_gain = new_gain
+        restart_sdr()
+    return jsonify({"status": "ok"})
+
+# --- STARTUP ---
+if __name__ == "__main__":
+    threading.Thread(target=sdr_manager_thread, daemon=True).start()
+    threading.Thread(target=logic_loop, daemon=True).start()
+    
+    app.run(host="0.0.0.0", port=80)
