@@ -1,0 +1,62 @@
+from collections import deque
+
+NOISE_WINDOW_S = 20.0      # hoe lang ruis wordt meegenomen
+MIN_MARGIN_DB = 3.0        # minimale afstand drempel boven ruis
+MAD_FACTOR = 4.0           # gevoeligheid t.o.v. ruisspreiding
+CONFIRM_HITS = 2           # aantal metingen op rij voor alarm
+
+class NoiseTracker:
+    def __init__(self):
+        self.samples = deque()
+    def reset(self):
+        self.samples.clear()
+    def add(self, now, db):
+        self.samples.append((now, db))
+        while self.samples and now - self.samples[0][0] > NOISE_WINDOW_S:
+            self.samples.popleft()
+    def threshold(self, user_offset):
+        if len(self.samples) < 30:
+            return None
+        vals = sorted(v for _, v in self.samples)
+        median = vals[len(vals) // 2]
+        mad = sorted(abs(v - median) for v in vals)[len(vals) // 2]
+        return median + max(MIN_MARGIN_DB, MAD_FACTOR * mad) + user_offset
+
+noise = NoiseTracker()
+state.user_offset = 0.0
+state.hit_count = 0
+
+def update_logic(db_val):
+    if state.is_shutting_down or db_val == NO_DATA_VALUE:
+        return
+    now_mono = monotonic_now()
+    noise.add(now_mono, db_val)
+
+    thr = noise.threshold(state.user_offset)
+    if thr is None:              # nog aan het inleren
+        return
+    set_floor_db(thr, auto=True)
+
+    state.is_active = db_val >= state.floor_db
+    state.hit_count = state.hit_count + 1 if db_val >= state.floor_db + ALARM_THRESHOLD_OFFSET else 0
+    if state.hit_count >= CONFIRM_HITS:
+        state.alarm_hold_mono = now_mono
+    state.current_is_alarm = (now_mono - state.alarm_hold_mono) < 2.0
+
+    # --- balken / peak-weergave: ongewijzigd uit v4 ---
+    db_range = MAX_THRESHOLD - NOISE_FLOOR_ESTIMATE
+    raw_ratio = max(0.0, min(1.0, (db_val - NOISE_FLOOR_ESTIMATE) / db_range))
+    target_steps = int((raw_ratio ** 2.2) * TOTAL_SIGNAL_STEPS)
+    # ... rest van je bestaande smoothing/peak-code hier ...
+
+def sdr_manager_thread():
+    restart_sdr()
+    threading.Thread(target=bluebark_lite.c_sdr_data_thread, args=(c_shared_state,), daemon=True).start()
+    while not state.is_shutting_down:
+        db_val = c_shared_state.consume_peak()
+        if db_val == NO_DATA_VALUE:
+            time.sleep(NO_DATA_SLEEP)
+            continue
+        state.has_received_data = True
+        publish_display_peak(db_val)
+        time.sleep(0.01)
